@@ -39,7 +39,17 @@ class VerisureAlarm(
     _attr_supported_features = (
         AlarmControlPanelEntityFeature.ARM_HOME
         | AlarmControlPanelEntityFeature.ARM_AWAY
+        | AlarmControlPanelEntityFeature.ARM_CUSTOM_BYPASS
     )
+
+    def __init__(self, coordinator: VerisureDataUpdateCoordinator) -> None:
+        """Initialize the Verisure alarm control panel."""
+        super().__init__(coordinator)
+        # True while armed away with a device bypassed; overrides the state
+        # normally derived from the coordinator's polled arm status, since
+        # Verisure itself only ever reports DISARMED/ARMED_HOME/ARMED_AWAY and
+        # has no bypass state of its own to read back.
+        self._bypass_active = False
 
     @property
     @override
@@ -60,7 +70,10 @@ class VerisureAlarm(
         return self.coordinator.config_entry.data[CONF_GIID]
 
     async def _async_set_arm_state(
-        self, state: str, command_data: dict[str, str | dict[str, str]]
+        self,
+        state: str,
+        command_data: dict[str, str | dict[str, str]],
+        failure_translation_key: str = "arm_state_failed",
     ) -> None:
         """Send set arm state command."""
         arm_state = await self.hass.async_add_executor_job(
@@ -99,6 +112,16 @@ class VerisureAlarm(
         if result == "OK":
             self._attr_alarm_state = ALARM_STATE_TO_HA.get(state)
             self.async_write_ha_state()
+            return
+        # The poll never confirmed the change. Refresh so the entity reflects
+        # the real (unchanged) state instead of staying stuck on ARMING, and
+        # raise so the user is told the attempt failed rather than it failing
+        # silently.
+        await self.coordinator.async_refresh()
+        raise HomeAssistantError(
+            translation_domain=DOMAIN,
+            translation_key=failure_translation_key,
+        )
 
     @override
     async def async_alarm_disarm(self, code: str | None = None) -> None:
@@ -111,29 +134,58 @@ class VerisureAlarm(
 
     @override
     async def async_alarm_arm_home(self, code: str | None = None) -> None:
-        """Send arm home command."""
+        """Send arm home command.
+
+        Always forces: arm home already tolerates devices such as interior
+        motion sensors being inactive by design, so forcing here is
+        consistent with what the mode already means.
+        """
         self._attr_alarm_state = AlarmControlPanelState.ARMING
         self.async_write_ha_state()
+        self._bypass_active = False
         await self._async_set_arm_state(
-            "ARMED_HOME",
-            self.coordinator.verisure.arm_home(code, force_arm=True),
+            "ARMED_HOME", self.coordinator.verisure.arm_home(code, force_arm=True)
         )
 
     @override
     async def async_alarm_arm_away(self, code: str | None = None) -> None:
-        """Send arm away command."""
+        """Send arm away command.
+
+        Does not force: arm away is meant to fully secure the home, so a
+        device that is out of place should block arming rather than being
+        silently bypassed. Use the bypass action to arm anyway.
+        """
+        self._attr_alarm_state = AlarmControlPanelState.ARMING
+        self.async_write_ha_state()
+        self._bypass_active = False
+        await self._async_set_arm_state(
+            "ARMED_AWAY",
+            self.coordinator.verisure.arm_away(code),
+            failure_translation_key="arm_away_requires_bypass",
+        )
+
+    @override
+    async def async_alarm_arm_custom_bypass(self, code: str | None = None) -> None:
+        """Arm away, forcing past any device that is out of place."""
         self._attr_alarm_state = AlarmControlPanelState.ARMING
         self.async_write_ha_state()
         await self._async_set_arm_state(
-            "ARMED_AWAY",
-            self.coordinator.verisure.arm_away(code, force_arm=True),
+            "ARMED_AWAY", self.coordinator.verisure.arm_away(code, force_arm=True)
         )
+        self._bypass_active = True
+        self._attr_alarm_state = AlarmControlPanelState.ARMED_CUSTOM_BYPASS
+        self.async_write_ha_state()
 
     def _update_alarm_attributes(self) -> None:
         """Update alarm state and changed by from coordinator data."""
-        self._attr_alarm_state = ALARM_STATE_TO_HA.get(
-            self.coordinator.data["alarm"]["statusType"]
-        )
+        status_type = self.coordinator.data["alarm"]["statusType"]
+        if self._bypass_active and status_type == "ARMED_AWAY":
+            # Verisure has no bypass state to read back; keep reporting the
+            # bypass state for as long as it's still armed away.
+            self._attr_alarm_state = AlarmControlPanelState.ARMED_CUSTOM_BYPASS
+        else:
+            self._bypass_active = False
+            self._attr_alarm_state = ALARM_STATE_TO_HA.get(status_type)
         self._attr_changed_by = self.coordinator.data["alarm"].get("name")
 
     @callback

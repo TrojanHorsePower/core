@@ -53,6 +53,9 @@
     }
   },
   "exceptions": {
+    "arm_away_requires_bypass": {
+      "message": "Could not arm away because a device reports a problem, such as an open door or window. Use the bypass action to arm anyway."
+    },
     "arm_state_failed": {
       "message": "Failed to change alarm state. Verify your code is correct and that your account is not temporarily locked."
     }
